@@ -1,7 +1,7 @@
 # CardFTx
-A FT4/FT8 client on Cardputer.
+A FT4/FT8 codec on Cardputer.
 ![示例](images/spectrum.png)
-
+![示例](images/screen.png)
 
 ## Installation
 
@@ -16,13 +16,14 @@ A FT4/FT8 client on Cardputer.
 
 ## Mode
 
-- 
+- FT8, FT4
 
-## Notice
+## Usage
 
-
+- **ESC**: Abort the current task  
+- **Fn + M**: Switch modulation/demodulation mode  
 
 ## Acknowledgements
 
 The FT8 core functionality of this project is made possible thanks to:  
-ft8_lib - A robust FT8 library for microcontrollers developed by kgoba.  
+[ft8_lib](https://github.com/kgoba/ft8_lib) - A robust FT8 library for microcontrollers developed by kgoba.
