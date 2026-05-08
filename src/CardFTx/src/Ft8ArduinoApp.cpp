@@ -43,6 +43,7 @@ static constexpr float kFt8SymbolBt = 2.0f;
 static constexpr float kGfskConstK = 5.336446f;
 static constexpr int kDecodeHistorySize = 8;
 static constexpr uint8_t kHidKeyEscape = 0x29;
+static constexpr int kTxStartGraceSeconds = 3;
 
 enum class RadioPhase : uint8_t {
     Boot,
@@ -601,6 +602,38 @@ static void maybeQueueAutoReply(const char* decodedText, float snr)
         autoQsoStage = 0;
         autoQsoCallsign[0] = '\0';
         portEXIT_CRITICAL(&appStateMux);
+    }
+}
+
+static void markAutoCqSent()
+{
+    if (kFtxAutoMode != FtxAutoMode::AutoCQ) {
+        return;
+    }
+
+    portENTER_CRITICAL(&appStateMux);
+    autoQsoStage = 1;
+    autoQsoCallsign[0] = '\0';
+    portEXIT_CRITICAL(&appStateMux);
+}
+
+static void finishAutoCqListenSlot()
+{
+    if (kFtxAutoMode != FtxAutoMode::AutoCQ) {
+        return;
+    }
+
+    bool readyForNextCq = false;
+    portENTER_CRITICAL(&appStateMux);
+    if (autoQsoStage > 0 && !autoTxPending) {
+        autoQsoStage = 0;
+        autoQsoCallsign[0] = '\0';
+        readyForNextCq = true;
+    }
+    portEXIT_CRITICAL(&appStateMux);
+
+    if (readyForNextCq) {
+        Serial.println("Auto CQ listen slot finished, no reply queued");
     }
 }
 
@@ -1378,7 +1411,7 @@ static void runDecodeWaterfall(const monitor_t& monitor, bool slotOdd, uint32_t 
     decodeWaterfall(monitor, slotOdd, slotEndUtc);
 }
 
-static bool receiveOnce()
+static bool receiveOnce(bool allowCurrentSlot = false)
 {
     if (!timeIsSynced()) {
         Serial.println("Time is not synced. Use: set SSID ..., set PASS ..., then sync");
@@ -1436,11 +1469,16 @@ static bool receiveOnce()
         return false;
     }
 
-    if (!waitForFt8Slot(true)) {
-        stopMicAndRestoreSpeaker();
-        monitor_free(&monitor);
-        setRadioPhase(timeIsSynced() ? RadioPhase::WaitTxSlot : RadioPhase::WaitSync);
-        return false;
+    const bool useCurrentSlot = allowCurrentSlot && currentSlotElapsedSeconds() <= kTxStartGraceSeconds;
+    if (useCurrentSlot) {
+        logUtcEvent("RX capture current slot");
+    } else {
+        if (!waitForFt8Slot(true)) {
+            stopMicAndRestoreSpeaker();
+            monitor_free(&monitor);
+            setRadioPhase(timeIsSynced() ? RadioPhase::WaitTxSlot : RadioPhase::WaitSync);
+            return false;
+        }
     }
     setRadioPhase(RadioPhase::RxCapture);
     bool captureSlotOdd = currentSlotIsOdd();
@@ -1474,6 +1512,9 @@ static bool receiveOnce()
         }
         if ((monitor.wf.num_blocks % 10) == 0) {
             Serial.print(".");
+        }
+        if (useCurrentSlot && time(nullptr) >= static_cast<time_t>(captureSlotEndUtc)) {
+            break;
         }
     }
     Serial.println();
@@ -1918,6 +1959,7 @@ static void radioTask(void*)
 {
     char txText[FTX_MAX_MESSAGE_LENGTH];
     float toneHz = kFtxDefaultTxToneHz;
+    bool allowCurrentRxSlot = false;
 
     while (true) {
         if (!timeIsSynced()) {
@@ -1931,6 +1973,7 @@ static void radioTask(void*)
         bool autoTxNow = false;
         bool autoTxWaiting = false;
         bool autoCqRxSlot = false;
+        bool autoCqTx = false;
         uint8_t autoTxStage = 0;
         bool currentOdd = currentSlotIsOdd();
         bool nextOdd = nextSlotIsOdd();
@@ -1942,7 +1985,8 @@ static void radioTask(void*)
             strncpy(txText, txMessage, sizeof(txText) - 1);
             txText[sizeof(txText) - 1] = '\0';
             toneHz = txToneHz;
-        } else if (ftxAutoEnabled() && autoTxPending && currentOdd == txSlotOdd && currentElapsed <= 1) {
+        } else if (ftxAutoEnabled() && autoTxPending && currentOdd == txSlotOdd &&
+            currentElapsed <= kTxStartGraceSeconds) {
             shouldTx = true;
             autoTx = true;
             autoTxNow = true;
@@ -1960,15 +2004,19 @@ static void radioTask(void*)
             toneHz = txToneHz;
             autoTxStage = autoQsoStage;
         } else if (kFtxAutoMode == FtxAutoMode::AutoCQ && autoQsoStage == 0 && currentOdd == txSlotOdd &&
-            currentElapsed <= 1) {
+            currentElapsed <= kTxStartGraceSeconds) {
             shouldTx = true;
             autoTx = true;
             autoTxNow = true;
+            autoCqTx = true;
+            autoTxStage = 1;
             formatStandardTxMessage(0, txText, sizeof(txText));
             toneHz = txToneHz;
         } else if (kFtxAutoMode == FtxAutoMode::AutoCQ && autoQsoStage == 0 && nextOdd == txSlotOdd) {
             shouldTx = true;
             autoTx = true;
+            autoCqTx = true;
+            autoTxStage = 1;
             formatStandardTxMessage(0, txText, sizeof(txText));
             toneHz = txToneHz;
         } else if (kFtxAutoMode == FtxAutoMode::AutoCQ && autoQsoStage == 0) {
@@ -1988,7 +2036,11 @@ static void radioTask(void*)
             if (autoTx) {
                 Serial.printf(autoTxNow ? "Auto TX now: %s\n" : "Auto TX: %s\n", txText);
             }
+            if (autoCqTx) {
+                markAutoCqSent();
+            }
             transmitFt8(txText, toneHz, !autoTxNow, autoTx);
+            allowCurrentRxSlot = true;
             if (autoTx && autoTxStage >= 4) {
                 portENTER_CRITICAL(&appStateMux);
                 autoQsoStage = 0;
@@ -1998,7 +2050,11 @@ static void radioTask(void*)
             continue;
         }
 
-        receiveOnce();
+        bool useCurrentRxSlot = allowCurrentRxSlot;
+        allowCurrentRxSlot = false;
+        if (receiveOnce(useCurrentRxSlot)) {
+            finishAutoCqListenSlot();
+        }
         delay(1);
     }
 }
