@@ -1,18 +1,7 @@
-# CardFTx
-A FT4/FT8 codec on Cardputer.
+# M5WSJTx
+A FT4/FT8 codec on M5Stack hardwares.
 ![示例](images/spectrum.png)
 ![示例](images/screen.jpeg)
-
-## Installation
-
-- **Board:** M5Stack (3.2.6, mic is disable on 3.3.7)  
-- **Libraries:** M5Cardputer (and all required dependencies)
-
-## Setting
-
-- **Partition Scheme:** 
-- **Flash Size:** 8MB(64Mb)  
-- **PSRAM:** QSPI PSRAM  
 
 ## Mode
 

@@ -1,4 +1,3 @@
 # Ignore PlatformIO generated secrets (if any)
-src/CardFTx/src/config.h
-src/CardFTx/.codex
-src/CardFTx/ft8_lib/
+src/Cardputer/src/config.h
+src/Tab5/src/config.h
