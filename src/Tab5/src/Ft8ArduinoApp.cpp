@@ -1,14 +1,18 @@
 #include "Ft8ArduinoApp.h"
 
+#if __has_include("config.h")
 #include "config.h"
+#else
+#include "config_example.h"
+#endif
 #include <M5Unified.h>
-#if __has_include(<M5UnitUnified.h>) && __has_include(<M5UnitUnifiedKEYBOARD.h>)
 #include <M5UnitUnified.h>
 #include <M5UnitUnifiedKEYBOARD.h>
 #define HAS_TAB5_KEYBOARD 1
-#endif
 
 #include <WiFi.h>
+#include <Wire.h>
+#include <esp_timer.h>
 #include <ctype.h>
 #include <esp_heap_caps.h>
 #include <freertos/semphr.h>
@@ -29,6 +33,10 @@
 #define TAB5_SDIO2_D2 GPIO_NUM_9
 #define TAB5_SDIO2_D3 GPIO_NUM_8
 #define TAB5_SDIO2_RST GPIO_NUM_15
+#define TAB5_KEYBOARD_SDA 0
+#define TAB5_KEYBOARD_SCL 1
+#define TAB5_KEYBOARD_INT 50
+#define TAB5_KEYBOARD_I2C_CLOCK 400000UL
 
 extern "C" {
 #include "common/monitor.h"
@@ -40,6 +48,7 @@ extern "C" {
 
 static constexpr int kTimeOsr = 1;
 static constexpr int kFreqOsr = 1;
+static constexpr int kAudioSampleRate = 12000;
 static constexpr int kMinScore = 10;
 static constexpr int kMaxCandidates = 240;
 static constexpr int kLdpcIterations = 35;
@@ -47,7 +56,15 @@ static constexpr int kMaxDecodedMessages = 80;
 static constexpr int kCallsignHashTableSize = 256;
 static constexpr int kSpeakerChunkSamples = 512;
 static constexpr int kSpeakerChannel = 0;
+static constexpr float kDefaultWorkFreqHz = 1000.0f;
+static constexpr bool kDefaultTxSlotOdd = true;
+static constexpr int kFallbackReportDb = -10;
 static constexpr uint32_t kRadioTaskStackBytes = 24 * 1024;
+static constexpr uint32_t kDecodeTaskStackBytes = 24 * 1024;
+static constexpr UBaseType_t kRadioTaskPriority = 4;
+static constexpr UBaseType_t kDecodeTaskPriority = 2;
+static constexpr int kRxMonitorBufferCount = 3;
+static constexpr int64_t kSlotStartLateToleranceUs = 250000;
 static constexpr int kFt8BlockSamples = static_cast<int>(kAudioSampleRate * FT8_SYMBOL_PERIOD);
 static constexpr uint8_t kDisplayTextSize = 3;
 static constexpr uint8_t kDisplaySmallTextSize = 2;
@@ -56,6 +73,15 @@ static constexpr float kGfskConstK = 5.336446f;
 static constexpr int kDecodeHistorySize = 8;
 static constexpr int kTxStartGraceSeconds = 3;
 static constexpr int kToolbarHeight = 64;
+
+#ifdef HAS_TAB5_KEYBOARD
+static constexpr uint8_t kHidBackspace = 0x2A;
+static constexpr uint8_t kHidTab = 0x2B;
+static constexpr uint8_t kHidEnter = 0x28;
+static constexpr uint8_t kHidEscape = 0x29;
+static constexpr uint8_t kHidSpace = 0x2C;
+static constexpr uint8_t kHidDelete = 0x4C;
+#endif
 
 enum class RadioPhase : uint8_t {
     Boot,
@@ -85,7 +111,9 @@ enum class EditField : uint8_t {
     None,
     Callsign,
     Grid,
-    WorkFreq
+    WorkFreq,
+    WifiSsid,
+    WifiPassword
 };
 
 struct DecodeHistoryItem {
@@ -99,18 +127,16 @@ struct DecodeHistoryItem {
 };
 
 static TaskHandle_t radioTaskHandle;
+static TaskHandle_t decodeTaskHandle;
 static TaskHandle_t uiTaskHandle;
+static QueueHandle_t decodeQueue;
 static SemaphoreHandle_t displayMutex;
 static portMUX_TYPE appStateMux = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool statusRefreshRequested = true;
-static char txMessage[FTX_MAX_MESSAGE_LENGTH];
-static float txToneHz = kFtxDefaultTxToneHz;
+static float workFreqHz = kDefaultWorkFreqHz;
 static bool txSlotOdd = false;
 static int16_t speakerBuffers[3][kSpeakerChunkSamples];
 static uint8_t speakerBufferIndex = 0;
-static bool isTransmitting = false;
-static bool isReceiving = false;
-static bool txRequested = false;
 static bool txCancelRequested = false;
 static bool autoTxPending = false;
 static char autoTxMessage[FTX_MAX_MESSAGE_LENGTH];
@@ -122,18 +148,16 @@ static UiView uiView = UiView::Home;
 static RuntimeAction runtimeAction = RuntimeAction::NoTx;
 static bool useSelectedRxTone = true;
 static ftx_protocol_t activeProtocol = FTX_PROTOCOL_FT8;
-static int latestRxDecodedCount = 0;
 static int unreadDecodedCount = 0;
 static DecodeHistoryItem decodeHistory[kDecodeHistorySize];
 static int decodeHistoryCount = 0;
-static float selectedRxToneHz = kFtxDefaultTxToneHz;
-static float selectedRxSnr = 0.0f;
-static uint32_t selectedRxUtc = 0;
+static float selectedRxToneHz = kDefaultWorkFreqHz;
 static char selectedRxText[FTX_MAX_MESSAGE_LENGTH];
 static char stationCallsign[12];
 static char stationGrid[8];
 static uint8_t speakerVolumePercent = 80;
 static EditField activeEditField = EditField::None;
+static String editInputBuffer;
 #ifdef HAS_TAB5_KEYBOARD
 static m5::unit::UnitUnified keyboardUnits;
 static m5::unit::UnitTab5Keyboard tab5Keyboard;
@@ -141,7 +165,6 @@ static bool tab5KeyboardReady = false;
 #endif
 static uint32_t lastDisplayMs = 0;
 static uint32_t lastClockRefreshMs = 0;
-static uint32_t displayHoldUntilMs = 0;
 static bool waterfallHistoryInitialized = false;
 static int waterfallHistoryRow = 0;
 static int16_t rxPcm[kFt8BlockSamples];
@@ -151,6 +174,20 @@ static uint64_t rxAbsSum = 0;
 static uint32_t rxSampleTotal = 0;
 static char wifiSsid[33];
 static char wifiPassword[65];
+static char settingNotice[40];
+static uint32_t settingNoticeUntilMs = 0;
+
+struct RxMonitorBuffer {
+    monitor_t monitor;
+    bool initialized;
+    volatile bool busy;
+    bool slotOdd;
+    uint32_t slotEndUtc;
+};
+
+static RxMonitorBuffer rxMonitorBuffers[kRxMonitorBufferCount];
+static ftx_protocol_t rxMonitorProtocol = FTX_PROTOCOL_FT8;
+static int rxCaptureBufferIndex = 0;
 
 static struct {
     char callsign[12];
@@ -158,30 +195,6 @@ static struct {
 } callsignHashtable[kCallsignHashTableSize];
 
 static int callsignHashtableSize = 0;
-
-static bool configTxSlotIsOdd()
-{
-    char slot[8];
-    strncpy(slot, kFtxTxSlot, sizeof(slot) - 1);
-    slot[sizeof(slot) - 1] = '\0';
-    for (char* cursor = slot; *cursor != '\0'; ++cursor) {
-        *cursor = static_cast<char>(toupper(static_cast<unsigned char>(*cursor)));
-    }
-    return strcmp(slot, "ODD") == 0;
-}
-
-static const char* ftxAutoModeText()
-{
-    switch (runtimeAction) {
-    case RuntimeAction::CQ:
-        return "CQ";
-    case RuntimeAction::Answer:
-        return "Answer";
-    case RuntimeAction::NoTx:
-    default:
-        return "NO TX";
-    }
-}
 
 static bool ftxAutoEnabled()
 {
@@ -225,7 +238,7 @@ static int protocolSymbolCount()
 static void formatStandardTxMessage(int index, char* out, size_t outSize)
 {
     char reportText[8];
-    snprintf(reportText, sizeof(reportText), "R%+03d", kFtxFallbackReportDb);
+    snprintf(reportText, sizeof(reportText), "R%+03d", kFallbackReportDb);
 
     switch (index) {
     case 0:
@@ -481,9 +494,30 @@ static int secondsToNextFt8Slot()
         return -1;
     }
 
+    uint32_t slotSeconds = static_cast<uint32_t>(protocolSlotTime() + 0.5f);
     time_t now = time(nullptr);
-    int sec = static_cast<int>(now % 15);
-    return (15 - sec) % 15;
+    int sec = static_cast<int>(now % slotSeconds);
+    return (slotSeconds - sec) % slotSeconds;
+}
+
+static uint32_t currentSlotStartUtc()
+{
+    uint32_t slotSeconds = static_cast<uint32_t>(protocolSlotTime() + 0.5f);
+    time_t now = time(nullptr);
+    return static_cast<uint32_t>(now - (now % slotSeconds));
+}
+
+static uint32_t nextSlotStartUtc()
+{
+    uint32_t slotSeconds = static_cast<uint32_t>(protocolSlotTime() + 0.5f);
+    time_t now = time(nullptr);
+    return static_cast<uint32_t>(((now / slotSeconds) + 1) * slotSeconds);
+}
+
+static bool slotStartIsOdd(uint32_t slotStartUtc)
+{
+    int sec = static_cast<int>(slotStartUtc % 60);
+    return sec == 0 || sec == 30;
 }
 
 static bool currentSlotIsOdd()
@@ -492,8 +526,7 @@ static bool currentSlotIsOdd()
         return false;
     }
 
-    int sec = static_cast<int>(time(nullptr) % 60);
-    return sec < 15 || (sec >= 30 && sec < 45);
+    return slotStartIsOdd(currentSlotStartUtc());
 }
 
 static bool nextSlotIsOdd()
@@ -502,9 +535,7 @@ static bool nextSlotIsOdd()
         return false;
     }
 
-    time_t nextSlot = ((time(nullptr) / 15) + 1) * 15;
-    int sec = static_cast<int>(nextSlot % 60);
-    return sec == 0 || sec == 30;
+    return slotStartIsOdd(nextSlotStartUtc());
 }
 
 static int currentSlotElapsedSeconds()
@@ -513,7 +544,8 @@ static int currentSlotElapsedSeconds()
         return 0;
     }
 
-    return static_cast<int>(time(nullptr) % 15);
+    uint32_t slotSeconds = static_cast<uint32_t>(protocolSlotTime() + 0.5f);
+    return static_cast<int>(time(nullptr) % slotSeconds);
 }
 
 static const char* phaseText(RadioPhase phase)
@@ -554,64 +586,10 @@ static const char* displayPhaseText(RadioPhase phase)
     }
 }
 
-static const char* nextActionText(RadioPhase phase, bool pendingTx)
-{
-    if (pendingTx && phase != RadioPhase::TxTransmit && phase != RadioPhase::WaitTxSlot) {
-        return "TX next slot";
-    }
-
-    switch (phase) {
-    case RadioPhase::WaitSync:
-        return "Need UTC sync";
-    case RadioPhase::WaitRxSlot:
-    case RadioPhase::RxCapture:
-    case RadioPhase::RxDecode:
-        return pendingTx ? "TX next slot" : "RX next slot";
-    case RadioPhase::WaitTxSlot:
-        return "Return RX";
-    case RadioPhase::TxTransmit:
-        return "Return RX";
-    case RadioPhase::Error:
-        return "Check serial";
-    default:
-        return "RX";
-    }
-}
-
-static const char* displayNextActionText(RadioPhase phase, bool txNext)
-{
-    if (phase == RadioPhase::TxTransmit) {
-        return "RX";
-    }
-
-    if (phase == RadioPhase::WaitTxSlot) {
-        return "TX";
-    }
-
-    if (txNext) {
-        return "TX";
-    }
-
-    switch (phase) {
-    case RadioPhase::WaitSync:
-        return "UTC";
-    case RadioPhase::WaitRxSlot:
-    case RadioPhase::RxCapture:
-    case RadioPhase::RxDecode:
-        return "RX";
-    case RadioPhase::Error:
-        return "Serial";
-    default:
-        return "RX";
-    }
-}
-
 static void setRadioPhase(RadioPhase phase)
 {
     portENTER_CRITICAL(&appStateMux);
     radioPhase = phase;
-    isReceiving = phase == RadioPhase::WaitRxSlot || phase == RadioPhase::RxCapture || phase == RadioPhase::RxDecode;
-    isTransmitting = phase == RadioPhase::WaitTxSlot || phase == RadioPhase::TxTransmit;
     statusRefreshRequested = true;
     portEXIT_CRITICAL(&appStateMux);
 }
@@ -619,6 +597,22 @@ static void setRadioPhase(RadioPhase phase)
 static void addMessageHistory(const char* text, float snr, float freqHz, float dtSec, bool slotOdd, uint32_t slotEndUtc,
     bool transmitted)
 {
+    uint32_t slotStartUtc = slotEndUtc;
+    uint32_t slotSeconds = static_cast<uint32_t>(protocolSlotTime());
+    if (slotEndUtc >= slotSeconds) {
+        slotStartUtc = slotEndUtc - slotSeconds;
+    }
+    char slotStartText[16];
+    formatUtcTimestamp(slotStartUtc, slotStartText, sizeof(slotStartText));
+    Serial.printf("%s history %s utc=%s snr=%+.1f dt=%+.2f freq=%.1f text=%s\n",
+        transmitted ? "TX" : "RX",
+        transmitted ? "add" : "decode",
+        slotStartText,
+        snr,
+        dtSec,
+        freqHz,
+        text);
+
     portENTER_CRITICAL(&appStateMux);
     for (int i = kDecodeHistorySize - 1; i > 0; --i) {
         decodeHistory[i] = decodeHistory[i - 1];
@@ -630,16 +624,13 @@ static void addMessageHistory(const char* text, float snr, float freqHz, float d
     decodeHistory[0].dtSec = dtSec;
     decodeHistory[0].slotOdd = slotOdd;
     decodeHistory[0].transmitted = transmitted;
-    decodeHistory[0].utc = slotEndUtc;
+    decodeHistory[0].utc = slotStartUtc;
     if (decodeHistoryCount < kDecodeHistorySize) {
         decodeHistoryCount++;
     }
     if (!transmitted) {
-        latestRxDecodedCount++;
         unreadDecodedCount++;
         selectedRxToneHz = freqHz;
-        selectedRxSnr = snr;
-        selectedRxUtc = slotEndUtc;
         strncpy(selectedRxText, text, sizeof(selectedRxText) - 1);
         selectedRxText[sizeof(selectedRxText) - 1] = '\0';
     }
@@ -659,7 +650,7 @@ static void addDecodeHistory(const char* text, float snr, float freqHz, float dt
 
 static void addTransmitHistory(const char* text, bool slotOdd, uint32_t slotEndUtc)
 {
-    addMessageHistory(text, 0.0f, txToneHz, 0.0f, slotOdd, slotEndUtc, true);
+    addMessageHistory(text, 0.0f, workFreqHz, 0.0f, slotOdd, slotEndUtc, true);
 }
 
 static void queueAutoTx(const char* text, const char* callsign, uint8_t stage)
@@ -706,7 +697,7 @@ static int clampReportDb(float snr)
 {
     int report = static_cast<int>(roundf(snr));
     if (report < -50 || report > 49) {
-        report = kFtxFallbackReportDb;
+        report = kFallbackReportDb;
     }
     return max(-50, min(49, report));
 }
@@ -854,51 +845,11 @@ static void setUiView(UiView view)
         waterfallHistoryInitialized = false;
     }
     portEXIT_CRITICAL(&appStateMux);
-    displayHoldUntilMs = 0;
-    lastDisplayMs = 0;
-}
-
-static void toggleUiView()
-{
-    UiView view;
-    portENTER_CRITICAL(&appStateMux);
-    switch (uiView) {
-    case UiView::Home:
-        view = UiView::TxSetting;
-        break;
-    case UiView::TxSetting:
-        view = UiView::Waterfall;
-        break;
-    case UiView::Waterfall:
-        view = UiView::Setting;
-        break;
-    default:
-        view = UiView::Home;
-        break;
-    }
-    uiView = view;
-    if (view == UiView::Home) {
-        unreadDecodedCount = 0;
-    }
-    if (view == UiView::Waterfall) {
-        waterfallHistoryInitialized = false;
-    }
-    portEXIT_CRITICAL(&appStateMux);
-    displayHoldUntilMs = 0;
     lastDisplayMs = 0;
 }
 
 static void renderStatus(bool force);
-static void requestManualTxNextSlot();
-
-static bool isUiView(UiView view)
-{
-    bool matches;
-    portENTER_CRITICAL(&appStateMux);
-    matches = uiView == view;
-    portEXIT_CRITICAL(&appStateMux);
-    return matches;
-}
+static bool waitForConfiguredTxSlot(bool abortOnTxRequest, uint32_t* slotStartUtc);
 
 static bool isTxCancelRequested()
 {
@@ -939,16 +890,16 @@ static void setActiveTxMessage(const char* text)
 
 static void requestTxCancel()
 {
-    bool wasPending;
     bool wasTransmitting;
+    bool hadAutoPending;
     portENTER_CRITICAL(&appStateMux);
-    wasPending = txRequested;
     wasTransmitting = radioPhase == RadioPhase::WaitTxSlot || radioPhase == RadioPhase::TxTransmit;
-    txRequested = false;
+    hadAutoPending = autoTxPending;
+    autoTxPending = false;
     txCancelRequested = true;
     portEXIT_CRITICAL(&appStateMux);
 
-    if (wasPending || wasTransmitting) {
+    if (hadAutoPending || wasTransmitting) {
         M5.Speaker.stop();
         if (radioTaskHandle != nullptr) {
             xTaskNotifyGive(radioTaskHandle);
@@ -957,6 +908,46 @@ static void requestTxCancel()
     } else {
         Serial.println("No TX to cancel");
     }
+    renderStatus(true);
+}
+
+static void beginEditField(EditField field)
+{
+    char buffer[72];
+    portENTER_CRITICAL(&appStateMux);
+    activeEditField = field;
+    if (field == EditField::Callsign) {
+        strncpy(buffer, stationCallsign, sizeof(buffer) - 1);
+    } else if (field == EditField::Grid) {
+        strncpy(buffer, stationGrid, sizeof(buffer) - 1);
+    } else if (field == EditField::WorkFreq) {
+        snprintf(buffer, sizeof(buffer), "%.0f", workFreqHz);
+    } else if (field == EditField::WifiSsid) {
+        strncpy(buffer, wifiSsid, sizeof(buffer) - 1);
+    } else if (field == EditField::WifiPassword) {
+        strncpy(buffer, wifiPassword, sizeof(buffer) - 1);
+    } else {
+        buffer[0] = '\0';
+    }
+    buffer[sizeof(buffer) - 1] = '\0';
+    portEXIT_CRITICAL(&appStateMux);
+
+    editInputBuffer = buffer;
+    Serial.printf("Edit field selected: %s\n",
+        field == EditField::Callsign ? "Callsign" :
+        (field == EditField::Grid ? "Grid" :
+        (field == EditField::WorkFreq ? "Work Freq" :
+        (field == EditField::WifiSsid ? "WLAN SSID" :
+        (field == EditField::WifiPassword ? "WLAN Password" : "None")))));
+}
+
+static void cancelActiveEdit()
+{
+    portENTER_CRITICAL(&appStateMux);
+    activeEditField = EditField::None;
+    portEXIT_CRITICAL(&appStateMux);
+    editInputBuffer = "";
+    Serial.println("Edit cancelled");
     renderStatus(true);
 }
 
@@ -998,24 +989,6 @@ static void renderCommandLineUnlocked()
         display.setCursor(x + max(8, (w - textW) / 2), y + 22);
         display.printf("%s", labels[i]);
     }
-}
-
-static void renderCommandLine()
-{
-    lockDisplay();
-    renderCommandLineUnlocked();
-    unlockDisplay();
-}
-
-static void drawRightText(const char* text, int y, uint8_t textSize, uint16_t color, int minX = 4)
-{
-    int screenW = M5.Display.width();
-    int textW = static_cast<int>(strlen(text)) * 6 * textSize;
-    int x = max(minX, screenW - textW - 4);
-    M5.Display.setTextSize(textSize);
-    M5.Display.setTextColor(color, TFT_BLACK);
-    M5.Display.setCursor(x, y);
-    M5.Display.printf("%s", text);
 }
 
 static uint16_t waterfallColor(uint8_t mag);
@@ -1096,6 +1069,43 @@ static void drawSlotDivider(uint32_t slotEndUtc, int y)
     M5.Display.drawLine(arrowX + 6, arrowY, arrowX + 3, arrowY + 4, TFT_DARKGREY);
 }
 
+static void drawHistoryHeader(int x, int y)
+{
+    M5.Display.setCursor(x, y);
+    M5.Display.printf("UTC");
+    M5.Display.setCursor(x + 112, y);
+    M5.Display.printf("dB");
+    M5.Display.setCursor(x + 176, y);
+    M5.Display.printf("DT");
+    M5.Display.setCursor(x + 252, y);
+    M5.Display.printf("Freq");
+    M5.Display.setCursor(x + 332, y);
+    M5.Display.printf("Message");
+}
+
+static void drawHistoryRow(int x, int y, const DecodeHistoryItem& item, const char* text)
+{
+    char rowUtc[16];
+    formatUtcTimestamp(item.utc, rowUtc, sizeof(rowUtc));
+
+    M5.Display.setCursor(x, y);
+    M5.Display.printf("%s", rowUtc);
+    M5.Display.setCursor(x + 112, y);
+    if (item.transmitted) {
+        M5.Display.printf("TX");
+    } else {
+        M5.Display.printf("%+4.0f", item.snr);
+    }
+    M5.Display.setCursor(x + 176, y);
+    if (!item.transmitted) {
+        M5.Display.printf("%+4.1f", item.dtSec);
+    }
+    M5.Display.setCursor(x + 252, y);
+    M5.Display.printf("%4.0f", item.freqHz);
+    M5.Display.setCursor(x + 332, y);
+    M5.Display.printf("%s", text);
+}
+
 static void renderStatus(bool force = false)
 {
     if (uiTaskHandle != nullptr && xTaskGetCurrentTaskHandle() != uiTaskHandle) {
@@ -1112,61 +1122,58 @@ static void renderStatus(bool force = false)
 
     RadioPhase phase;
     UiView view;
-    bool pendingTx;
-    bool autoPending;
-    int unreadCount;
     int historyCount;
-    int decodedCount;
     DecodeHistoryItem history[kDecodeHistorySize];
     float toneHz;
     bool configuredTxSlotOdd;
-    uint8_t qsoStage;
-    char txPreview[FTX_MAX_MESSAGE_LENGTH];
     char selectedText[FTX_MAX_MESSAGE_LENGTH];
     float selectedToneHz;
-    float selectedSnr;
-    uint32_t selectedUtc;
     RuntimeAction action;
     bool answerOnWorkFreq;
+    EditField editingField;
+    char editingText[72];
     char callText[sizeof(stationCallsign)];
     char gridText[sizeof(stationGrid)];
+    char ssidText[sizeof(wifiSsid)];
     uint8_t volumePercent;
+    bool wlanConnected;
+    char connectedSsid[33];
+    char noticeText[sizeof(settingNotice)];
+    bool showNotice;
 
     portENTER_CRITICAL(&appStateMux);
     phase = radioPhase;
     view = uiView;
-    pendingTx = txRequested;
-    autoPending = autoTxPending;
-    unreadCount = unreadDecodedCount;
     historyCount = decodeHistoryCount;
-    decodedCount = latestRxDecodedCount;
     memcpy(history, decodeHistory, sizeof(history));
-    toneHz = txToneHz;
+    toneHz = workFreqHz;
     configuredTxSlotOdd = txSlotOdd;
-    qsoStage = autoQsoStage;
     strncpy(selectedText, selectedRxText, sizeof(selectedText) - 1);
     selectedText[sizeof(selectedText) - 1] = '\0';
     selectedToneHz = selectedRxToneHz;
-    selectedSnr = selectedRxSnr;
-    selectedUtc = selectedRxUtc;
     action = runtimeAction;
     answerOnWorkFreq = useSelectedRxTone;
+    editingField = activeEditField;
     strncpy(callText, stationCallsign, sizeof(callText) - 1);
     callText[sizeof(callText) - 1] = '\0';
     strncpy(gridText, stationGrid, sizeof(gridText) - 1);
     gridText[sizeof(gridText) - 1] = '\0';
+    strncpy(ssidText, wifiSsid, sizeof(ssidText) - 1);
+    ssidText[sizeof(ssidText) - 1] = '\0';
     volumePercent = speakerVolumePercent;
-    txPreview[0] = '\0';
-    if (phase == RadioPhase::WaitTxSlot || phase == RadioPhase::TxTransmit) {
-        strncpy(txPreview, activeTxMessage, sizeof(txPreview) - 1);
-        txPreview[sizeof(txPreview) - 1] = '\0';
-    }
+    strncpy(noticeText, settingNotice, sizeof(noticeText) - 1);
+    noticeText[sizeof(noticeText) - 1] = '\0';
+    uint32_t noticeUntil = settingNoticeUntilMs;
     portEXIT_CRITICAL(&appStateMux);
+    wlanConnected = WiFi.status() == WL_CONNECTED;
+    String currentSsid = WiFi.SSID();
+    currentSsid.toCharArray(connectedSsid, sizeof(connectedSsid));
+    showNotice = noticeText[0] != '\0' && millis() < noticeUntil;
+    editInputBuffer.toCharArray(editingText, sizeof(editingText));
 
     char utcText[16];
     formatUtcTime(utcText, sizeof(utcText));
     int waitSec = secondsToNextFt8Slot();
-    bool nextOdd = nextSlotIsOdd();
     const char* statusText = displayPhaseText(phase);
 
     lockDisplay();
@@ -1188,28 +1195,23 @@ static void renderStatus(bool force = false)
         M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
         M5.Display.setCursor(16, 16);
         M5.Display.printf("TX Setting");
-        M5.Display.drawRect(screenW - 268, 14, 112, 48, TFT_DARKGREY);
-        M5.Display.drawRect(screenW - 136, 14, 112, 48, TFT_DARKGREY);
-        M5.Display.setTextColor(TFT_RED, TFT_BLACK);
-        M5.Display.setCursor(screenW - 228, 24);
-        M5.Display.printf("TX");
-        M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-        M5.Display.setCursor(screenW - 126, 24);
-        M5.Display.printf("Cancel");
         M5.Display.drawFastHLine(16, 70, screenW - 32, TFT_DARKGREY);
 
         M5.Display.setTextSize(kDisplaySmallTextSize);
         int halfW = (screenW - 48) / 2;
-        M5.Display.drawRect(16, 94, halfW, 70, TFT_DARKGREY);
+        M5.Display.drawRect(16, 94, halfW, 70, editingField == EditField::WorkFreq ? TFT_CYAN : TFT_DARKGREY);
         M5.Display.drawRect(32 + halfW, 94, halfW, 70, TFT_DARKGREY);
-        M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        M5.Display.setTextColor(editingField == EditField::WorkFreq ? TFT_CYAN : TFT_DARKGREY, TFT_BLACK);
         M5.Display.setCursor(32, 106);
         M5.Display.printf("Work Freq");
+        M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
         M5.Display.setCursor(48 + halfW, 106);
         M5.Display.printf("TX Slot");
-        M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+        M5.Display.setTextColor(editingField == EditField::WorkFreq ? TFT_YELLOW : TFT_WHITE, TFT_BLACK);
         M5.Display.setCursor(32, 132);
-        if (answerOnWorkFreq) {
+        if (editingField == EditField::WorkFreq) {
+            M5.Display.printf("%s_", editingText);
+        } else if (answerOnWorkFreq) {
             M5.Display.printf("%.0f Hz", toneHz);
         } else {
             M5.Display.printf("any Freq");
@@ -1237,7 +1239,7 @@ static void renderStatus(bool force = false)
         M5.Display.printf("%s", presetText);
         M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
         M5.Display.setCursor(16, contentBottom - 32);
-        M5.Display.printf("Tap TX to queue the selected message for the next slot");
+        M5.Display.printf("Work Freq is shared with Home");
         renderCommandLineUnlocked();
         unlockDisplay();
         return;
@@ -1252,21 +1254,28 @@ static void renderStatus(bool force = false)
 
         M5.Display.setTextSize(kDisplaySmallTextSize);
         int rowY[] = { 88, 154, 220, 286, 352 };
-        const char* names[] = { "Callsign", "Grid", "Volume", "WiFi Config", "Sync Time" };
+        const char* names[] = { "Callsign", "Grid", "Volume", "WLAN Config", "Sync Time" };
         for (int i = 0; i < 5; ++i) {
-            M5.Display.drawRect(16, rowY[i], screenW - 32, 56, TFT_DARKGREY);
-            M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+            bool rowEditing = (i == 0 && editingField == EditField::Callsign) ||
+                (i == 1 && editingField == EditField::Grid) ||
+                (i == 3 && (editingField == EditField::WifiSsid || editingField == EditField::WifiPassword));
+            M5.Display.drawRect(16, rowY[i], screenW - 32, 56, rowEditing ? TFT_CYAN : TFT_DARKGREY);
+            M5.Display.setTextColor(rowEditing ? TFT_CYAN : TFT_DARKGREY, TFT_BLACK);
             M5.Display.setCursor(34, rowY[i] + 10);
             M5.Display.printf("%s", names[i]);
         }
 
-        M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+        M5.Display.setTextColor(editingField == EditField::Callsign ? TFT_YELLOW : TFT_WHITE, TFT_BLACK);
         M5.Display.setCursor(360, rowY[0] + 22);
-        M5.Display.printf("%s", callText);
+        M5.Display.printf("%s%s", editingField == EditField::Callsign ? editingText : callText,
+            editingField == EditField::Callsign ? "_" : "");
 
+        M5.Display.setTextColor(editingField == EditField::Grid ? TFT_YELLOW : TFT_WHITE, TFT_BLACK);
         M5.Display.setCursor(360, rowY[1] + 22);
-        M5.Display.printf("%s", gridText);
+        M5.Display.printf("%s%s", editingField == EditField::Grid ? editingText : gridText,
+            editingField == EditField::Grid ? "_" : "");
 
+        M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
         M5.Display.setCursor(360, rowY[2] + 22);
         M5.Display.printf("%u%%", volumePercent);
         M5.Display.drawRect(screenW - 220, rowY[2] + 10, 82, 42, TFT_DARKGREY);
@@ -1275,11 +1284,39 @@ static void renderStatus(bool force = false)
         M5.Display.printf("-");
         M5.Display.setCursor(screenW - 94, rowY[2] + 22);
         M5.Display.printf("+");
-        M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+
+        M5.Display.setTextColor(
+            editingField == EditField::WifiSsid || editingField == EditField::WifiPassword ? TFT_YELLOW :
+            (wlanConnected ? TFT_GREEN : TFT_RED),
+            TFT_BLACK);
         M5.Display.setCursor(360, rowY[3] + 20);
-        M5.Display.printf("Coming soon");
-        M5.Display.setCursor(360, rowY[4] + 20);
-        M5.Display.printf("Coming soon");
+        if (editingField == EditField::WifiSsid) {
+            M5.Display.printf("SSID: %s_", editingText);
+        } else if (editingField == EditField::WifiPassword) {
+            M5.Display.printf("Password: ");
+            for (size_t i = 0; i < strlen(editingText); ++i) {
+                M5.Display.print("*");
+            }
+            M5.Display.print("_");
+        } else if (wlanConnected) {
+            M5.Display.printf("%s", connectedSsid[0] != '\0' ? connectedSsid : ssidText);
+        } else {
+            M5.Display.printf("Not Connected");
+        }
+        M5.Display.drawRect(screenW - 180, rowY[3] + 10, 142, 42, TFT_DARKGREY);
+        M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+        M5.Display.setCursor(screenW - 140, rowY[3] + 22);
+        M5.Display.printf("Set");
+
+        M5.Display.drawRect(screenW - 180, rowY[4] + 10, 142, 42, TFT_DARKGREY);
+        M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+        M5.Display.setCursor(screenW - 150, rowY[4] + 22);
+        M5.Display.printf("Sync");
+        if (showNotice) {
+            M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
+            M5.Display.setCursor(360, rowY[4] + 20);
+            M5.Display.printf("%s", noticeText);
+        }
         renderCommandLineUnlocked();
         unlockDisplay();
         return;
@@ -1326,14 +1363,17 @@ static void renderStatus(bool force = false)
     int anyButtonX = screenW - 210;
     int buttonY = 70;
     int buttonH = 42;
+    bool editingWorkFreq = editingField == EditField::WorkFreq;
     M5.Display.fillRect(freqButtonX, buttonY, 196, buttonH, answerOnWorkFreq ? TFT_DARKCYAN : TFT_BLACK);
     bool anyEnabled = action != RuntimeAction::CQ;
     M5.Display.fillRect(anyButtonX, buttonY, 190, buttonH, answerOnWorkFreq || !anyEnabled ? TFT_BLACK : TFT_DARKCYAN);
-    M5.Display.drawRect(freqButtonX, buttonY, 196, buttonH, TFT_DARKGREY);
+    M5.Display.drawRect(freqButtonX, buttonY, 196, buttonH, editingWorkFreq ? TFT_CYAN : TFT_DARKGREY);
     M5.Display.drawRect(anyButtonX, buttonY, 190, buttonH, TFT_DARKGREY);
-    M5.Display.setTextColor(TFT_WHITE, answerOnWorkFreq ? TFT_DARKCYAN : TFT_BLACK);
+    M5.Display.setTextColor(editingWorkFreq ? TFT_YELLOW : TFT_WHITE, answerOnWorkFreq ? TFT_DARKCYAN : TFT_BLACK);
     M5.Display.setCursor(freqButtonX + 14, 76);
-    if (answerOnWorkFreq) {
+    if (editingWorkFreq) {
+        M5.Display.printf("%s_", editingText);
+    } else if (answerOnWorkFreq) {
         M5.Display.printf("%.0f Hz", toneHz);
     } else {
         M5.Display.printf("%.0f Hz", toneHz);
@@ -1371,11 +1411,9 @@ static void renderStatus(bool force = false)
 
     M5.Display.setTextSize(kDisplaySmallTextSize);
     M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
-    M5.Display.setCursor(28, panelTop + 14);
-    M5.Display.printf("UTC     dB    DT  Freq  Message");
+    drawHistoryHeader(28, panelTop + 14);
     M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
-    M5.Display.setCursor(rightX + 12, panelTop + 14);
-    M5.Display.printf("UTC     dB    DT  Freq  Message");
+    drawHistoryHeader(rightX + 12, panelTop + 14);
 
     int y = panelTop + 48;
     bool drewRxLine = false;
@@ -1383,17 +1421,13 @@ static void renderStatus(bool force = false)
         if (history[i].transmitted) {
             continue;
         }
-        char shortText[34];
+        char shortText[26];
         strncpy(shortText, history[i].text, sizeof(shortText) - 1);
         shortText[sizeof(shortText) - 1] = '\0';
         bool selected = !history[i].transmitted && fabsf(history[i].freqHz - selectedToneHz) < 0.5f &&
             strcmp(history[i].text, selectedText) == 0;
         M5.Display.setTextColor(selected ? TFT_YELLOW : TFT_WHITE, TFT_BLACK);
-        M5.Display.setCursor(28, y);
-        char rowUtc[16];
-        formatUtcTimestamp(history[i].utc, rowUtc, sizeof(rowUtc));
-        M5.Display.printf("%s %+4.0f %+4.1f %4.0f  %s", rowUtc, history[i].snr, history[i].dtSec,
-            history[i].freqHz, shortText);
+        drawHistoryRow(28, y, history[i], shortText);
         y += 28;
         drewRxLine = true;
     }
@@ -1404,24 +1438,17 @@ static void renderStatus(bool force = false)
     }
 
     int qsoY = panelTop + 48;
-    for (int i = historyCount - 1; i >= 0 && qsoY < contentBottom - 18; --i) {
-        bool show = history[i].transmitted || !answerOnWorkFreq || fabsf(history[i].freqHz - toneHz) <= 25.0f;
+    for (int i = 0; i < historyCount && qsoY < contentBottom - 18; ++i) {
+        bool show = history[i].transmitted || action == RuntimeAction::NoTx ||
+            !answerOnWorkFreq || fabsf(history[i].freqHz - toneHz) <= 25.0f;
         if (!show) {
             continue;
         }
-        char shortText[36];
+        char shortText[24];
         strncpy(shortText, history[i].text, sizeof(shortText) - 1);
         shortText[sizeof(shortText) - 1] = '\0';
         M5.Display.setTextColor(history[i].transmitted ? TFT_RED : TFT_WHITE, TFT_BLACK);
-        M5.Display.setCursor(rightX + 12, qsoY);
-        char rowUtc[16];
-        formatUtcTimestamp(history[i].utc, rowUtc, sizeof(rowUtc));
-        if (history[i].transmitted) {
-            M5.Display.printf("%s  TX        %4.0f  %s", rowUtc, history[i].freqHz, shortText);
-        } else {
-            M5.Display.printf("%s %+4.0f %+4.1f %4.0f  %s", rowUtc, history[i].snr, history[i].dtSec,
-                history[i].freqHz, shortText);
-        }
+        drawHistoryRow(rightX + 12, qsoY, history[i], shortText);
         qsoY += 28;
     }
     if (qsoY == panelTop + 48) {
@@ -1476,16 +1503,6 @@ static void refreshHomeClockRow()
     unlockDisplay();
 }
 
-static void returnHomeForCommandInput()
-{
-    if (displayHoldUntilMs == 0) {
-        return;
-    }
-
-    displayHoldUntilMs = 0;
-    renderStatus(true);
-}
-
 static uint8_t waterfallMagnitudeToByte(const WF_ELEM_T& value)
 {
 #ifdef WATERFALL_USE_PHASE
@@ -1524,6 +1541,123 @@ static void renderRxWaterfall(const monitor_t& monitor)
 static void renderWaterfallTxDivider()
 {
     return;
+}
+
+static monitor_config_t makeMonitorConfig()
+{
+    monitor_config_t config;
+    config.f_min = 200.0f;
+    config.f_max = 3000.0f;
+    config.sample_rate = kAudioSampleRate;
+    config.time_osr = kTimeOsr;
+    config.freq_osr = kFreqOsr;
+    config.protocol = activeProtocol;
+    return config;
+}
+
+static bool monitorReady(const monitor_t& monitor)
+{
+    return monitor.window != nullptr && monitor.last_frame != nullptr &&
+        monitor.fft_timedata != nullptr && monitor.fft_freqdata != nullptr &&
+        monitor.fft_work != nullptr && monitor.wf.mag != nullptr;
+}
+
+static void freeRxMonitorBuffers()
+{
+    for (int i = 0; i < kRxMonitorBufferCount; ++i) {
+        if (rxMonitorBuffers[i].initialized) {
+            monitor_free(&rxMonitorBuffers[i].monitor);
+            rxMonitorBuffers[i].initialized = false;
+        }
+        rxMonitorBuffers[i].busy = false;
+    }
+}
+
+static bool ensureRxMonitorBuffers()
+{
+    bool anyBusy = false;
+    for (int i = 0; i < kRxMonitorBufferCount; ++i) {
+        anyBusy = anyBusy || rxMonitorBuffers[i].busy;
+    }
+    if (rxMonitorBuffers[0].initialized && rxMonitorProtocol == activeProtocol) {
+        return true;
+    }
+    if (anyBusy) {
+        Serial.println("RX monitor protocol change deferred: decode still busy");
+        return false;
+    }
+
+    freeRxMonitorBuffers();
+    monitor_config_t config = makeMonitorConfig();
+    rxMonitorProtocol = activeProtocol;
+
+    float symbolPeriod = protocolSymbolPeriod();
+    int maxBlocks = static_cast<int>(protocolSlotTime() / symbolPeriod);
+    int minBin = static_cast<int>(config.f_min * symbolPeriod);
+    int maxBin = static_cast<int>(config.f_max * symbolPeriod) + 1;
+    int numBins = maxBin - minBin;
+    size_t waterfallBytes = static_cast<size_t>(maxBlocks) * config.time_osr * config.freq_osr * numBins;
+    size_t fftBytes = static_cast<size_t>(config.sample_rate * symbolPeriod * config.freq_osr) *
+        (sizeof(float) * 3 + sizeof(kiss_fft_cpx));
+    Serial.printf("RX monitor init: buffers=%d waterfall=%u each, fft~= %u each, heap=%u\n",
+        kRxMonitorBufferCount,
+        static_cast<unsigned>(waterfallBytes),
+        static_cast<unsigned>(fftBytes),
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+
+    for (int i = 0; i < kRxMonitorBufferCount; ++i) {
+        monitor_init(&rxMonitorBuffers[i].monitor, &config);
+        if (!monitorReady(rxMonitorBuffers[i].monitor)) {
+            Serial.printf("RX monitor buffer %d allocation failed\n", i);
+            freeRxMonitorBuffers();
+            setRadioPhase(RadioPhase::Error);
+            return false;
+        }
+        rxMonitorBuffers[i].initialized = true;
+        rxMonitorBuffers[i].busy = false;
+        monitor_reset(&rxMonitorBuffers[i].monitor);
+    }
+
+    rxCaptureBufferIndex = 0;
+    return true;
+}
+
+static int acquireRxCaptureBuffer()
+{
+    for (int step = 0; step < kRxMonitorBufferCount; ++step) {
+        int index = (rxCaptureBufferIndex + step) % kRxMonitorBufferCount;
+        if (!rxMonitorBuffers[index].busy) {
+            rxCaptureBufferIndex = (index + 1) % kRxMonitorBufferCount;
+            rxMonitorBuffers[index].busy = true;
+            monitor_reset(&rxMonitorBuffers[index].monitor);
+            return index;
+        }
+    }
+    return -1;
+}
+
+static void releaseRxCaptureBuffer(int index)
+{
+    if (index < 0 || index >= kRxMonitorBufferCount) {
+        return;
+    }
+    rxMonitorBuffers[index].busy = false;
+}
+
+static bool queueRxDecodeBuffer(int index, bool slotOdd, uint32_t slotEndUtc)
+{
+    if (decodeQueue == nullptr || index < 0 || index >= kRxMonitorBufferCount) {
+        releaseRxCaptureBuffer(index);
+        return false;
+    }
+    rxMonitorBuffers[index].slotOdd = slotOdd;
+    rxMonitorBuffers[index].slotEndUtc = slotEndUtc;
+    if (xQueueSend(decodeQueue, &index, 0) != pdTRUE) {
+        Serial.printf("RX decode queue full, dropping buffer %d\n", index);
+        releaseRxCaptureBuffer(index);
+        return false;
+    }
+    return true;
 }
 
 static bool connectWifi(const char* ssid, const char* password, uint32_t timeoutMs = 15000)
@@ -1590,7 +1724,7 @@ static bool syncTime(uint32_t timeoutMs = 15000)
     return true;
 }
 
-static bool waitForFt8Slot(bool abortOnTxRequest = false)
+static bool waitForFt8Slot(bool abortOnTxRequest = false, uint32_t* slotStartUtc = nullptr)
 {
     if (!timeIsSynced()) {
         Serial.println("Time is not synced");
@@ -1598,44 +1732,59 @@ static bool waitForFt8Slot(bool abortOnTxRequest = false)
         return false;
     }
 
-    struct timeval tvStart;
-    gettimeofday(&tvStart, nullptr);
-    time_t target = ((tvStart.tv_sec / 15) + 1) * 15;
-    int waitSec = static_cast<int>(target - tvStart.tv_sec);
-    Serial.printf("Waiting for next %s slot: %d s\n", protocolText(), waitSec);
-
     while (true) {
-        struct timeval tv;
-        gettimeofday(&tv, nullptr);
-        int64_t remainingUs = (static_cast<int64_t>(target - tv.tv_sec) * 1000000LL) - tv.tv_usec;
-        if (remainingUs <= 0) {
-            break;
-        }
-        if (!abortOnTxRequest && isTxCancelRequested()) {
-            return false;
-        }
-        if (abortOnTxRequest) {
-            bool pendingTx;
-            portENTER_CRITICAL(&appStateMux);
-            pendingTx = txRequested;
-            portEXIT_CRITICAL(&appStateMux);
-            if (pendingTx) {
+        struct timeval tvStart;
+        gettimeofday(&tvStart, nullptr);
+        uint32_t slotSeconds = static_cast<uint32_t>(protocolSlotTime() + 0.5f);
+        time_t target = ((tvStart.tv_sec / slotSeconds) + 1) * slotSeconds;
+        int64_t startMonoUs = esp_timer_get_time();
+        int64_t targetMonoUs = startMonoUs +
+            ((static_cast<int64_t>(target - tvStart.tv_sec) * 1000000LL) - tvStart.tv_usec);
+        int waitSec = static_cast<int>(target - tvStart.tv_sec);
+        char targetText[16];
+        formatUtcTimestamp(static_cast<uint32_t>(target), targetText, sizeof(targetText));
+        Serial.printf("Waiting for next %s slot: %d s, target=%s\n", protocolText(), waitSec, targetText);
+
+        while (true) {
+            int64_t remainingUs = targetMonoUs - esp_timer_get_time();
+            if (remainingUs <= 0) {
+                break;
+            }
+            if (!abortOnTxRequest && isTxCancelRequested()) {
                 return false;
+            }
+            if (remainingUs > 300000) {
+                delay(50);
+            } else {
+                delay(5);
             }
         }
 
-        if (remainingUs > 300000) {
-            delay(50);
-        } else {
-            delay(5);
+        int64_t lateUs = esp_timer_get_time() - targetMonoUs;
+        time_t nowUtc = time(nullptr);
+        if (lateUs > kSlotStartLateToleranceUs || nowUtc >= target + static_cast<time_t>(slotSeconds)) {
+            Serial.printf("Missed %s slot target=%s late=%lld ms, waiting next slot\n",
+                protocolText(),
+                targetText,
+                static_cast<long long>(lateUs / 1000));
+            continue;
         }
-    }
 
-    return true;
+        if (slotStartUtc != nullptr) {
+            *slotStartUtc = static_cast<uint32_t>(target);
+        }
+        return true;
+    }
 }
 
 static void ensureSpeakerReady()
 {
+    if (M5.Mic.isEnabled()) {
+        while (M5.Mic.isRecording()) {
+            delay(1);
+        }
+        M5.Mic.end();
+    }
     if (!M5.Speaker.isEnabled()) {
         M5.Speaker.begin();
         applySpeakerVolume();
@@ -1647,13 +1796,6 @@ static void ensureMicReady()
     if (M5.Speaker.isEnabled()) {
         M5.Speaker.stop();
         M5.Speaker.end();
-    }
-
-    if (M5.Mic.isEnabled()) {
-        while (M5.Mic.isRecording()) {
-            delay(1);
-        }
-        M5.Mic.end();
     }
 
     if (!M5.Mic.isEnabled()) {
@@ -1685,6 +1827,16 @@ static void stopMicAndRestoreSpeaker()
 
 static void decodeWaterfall(const monitor_t& monitor, bool slotOdd, uint32_t slotEndUtc)
 {
+    char slotEndText[16];
+    formatUtcTimestamp(slotEndUtc, slotEndText, sizeof(slotEndText));
+    Serial.printf("RX decode slot_end=%s slot=%s blocks=%d/%d bins=%d max_mag=%.1f\n",
+        slotEndText,
+        slotOdd ? "Odd" : "Even",
+        monitor.wf.num_blocks,
+        monitor.wf.max_blocks,
+        monitor.wf.num_bins,
+        monitor.max_mag);
+
     const ftx_waterfall_t* wf = &monitor.wf;
     ftx_candidate_t* candidateList = static_cast<ftx_candidate_t*>(
         appFastMalloc(sizeof(ftx_candidate_t) * kMaxCandidates));
@@ -1751,14 +1903,18 @@ static void decodeWaterfall(const monitor_t& monitor, bool slotOdd, uint32_t slo
         ftx_message_rc_t unpack = ftx_message_decode(&message, &hashIf, text, &offsets);
         if (unpack != FTX_MESSAGE_RC_OK) {
             snprintf(text, sizeof(text), "unpack error %d", static_cast<int>(unpack));
+            Serial.printf("RX unpack failed rc=%d hash=%lu\n", static_cast<int>(unpack),
+                static_cast<unsigned long>(message.hash));
         }
 
-        Serial.printf("%s %+05.1f dB %+4.2f s %4.0f Hz ~ %s\n", protocolText(), snr, timeSec, freqHz, text);
+        Serial.printf("RX decoded %s %+05.1f dB %+4.2f s %4.0f Hz ~ %s\n",
+            protocolText(), snr, timeSec, freqHz, text);
         addDecodeHistory(text, snr, freqHz, timeSec, slotOdd, slotEndUtc);
         maybeQueueAutoReply(text, snr);
     }
 
     Serial.printf("RX decoded: %d, callsign hashes: %d\n", numDecoded, callsignHashtableSize);
+    statusRefreshRequested = true;
     hashtableCleanup(10);
 
     free(decodedHashtable);
@@ -1771,6 +1927,31 @@ static void runDecodeWaterfall(const monitor_t& monitor, bool slotOdd, uint32_t 
     decodeWaterfall(monitor, slotOdd, slotEndUtc);
 }
 
+static void decodeTask(void*)
+{
+    int index = -1;
+    while (true) {
+        if (xQueueReceive(decodeQueue, &index, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        if (index < 0 || index >= kRxMonitorBufferCount || !rxMonitorBuffers[index].initialized) {
+            continue;
+        }
+
+        char slotEndText[16];
+        formatUtcTimestamp(rxMonitorBuffers[index].slotEndUtc, slotEndText, sizeof(slotEndText));
+        Serial.printf("RX decode task: buffer=%d slot_end=%s\n", index, slotEndText);
+        logUtcEvent("RX decode start");
+        runDecodeWaterfall(
+            rxMonitorBuffers[index].monitor,
+            rxMonitorBuffers[index].slotOdd,
+            rxMonitorBuffers[index].slotEndUtc);
+        logUtcEvent("RX decode done");
+        monitor_reset(&rxMonitorBuffers[index].monitor);
+        rxMonitorBuffers[index].busy = false;
+    }
+}
+
 static bool receiveOnce(bool allowCurrentSlot = false)
 {
     if (!timeIsSynced()) {
@@ -1779,44 +1960,27 @@ static bool receiveOnce(bool allowCurrentSlot = false)
         return false;
     }
 
-    stopMicAndRestoreSpeaker();
+    M5.Speaker.stop();
     M5.Speaker.end();
 
-    monitor_config_t config;
-    config.f_min = 200.0f;
-    config.f_max = 3000.0f;
-    config.sample_rate = kAudioSampleRate;
-    config.time_osr = kTimeOsr;
-    config.freq_osr = kFreqOsr;
-    config.protocol = activeProtocol;
-
-    float symbolPeriod = protocolSymbolPeriod();
-    int maxBlocks = static_cast<int>(protocolSlotTime() / symbolPeriod);
-    int minBin = static_cast<int>(config.f_min * symbolPeriod);
-    int maxBin = static_cast<int>(config.f_max * symbolPeriod) + 1;
-    int numBins = maxBin - minBin;
-    size_t waterfallBytes = static_cast<size_t>(maxBlocks) * config.time_osr * config.freq_osr * numBins;
-    size_t fftBytes = static_cast<size_t>(config.sample_rate * symbolPeriod * config.freq_osr) *
-        (sizeof(float) * 3 + sizeof(kiss_fft_cpx));
-    Serial.printf("RX alloc estimate: waterfall=%u, fft~= %u, heap=%u\n",
-        static_cast<unsigned>(waterfallBytes),
-        static_cast<unsigned>(fftBytes),
-        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-
-    monitor_t monitor;
-    monitor_init(&monitor, &config);
-    if (monitor.window == nullptr || monitor.last_frame == nullptr ||
-        monitor.fft_timedata == nullptr || monitor.fft_freqdata == nullptr ||
-        monitor.fft_work == nullptr || monitor.wf.mag == nullptr) {
-        Serial.println("RX monitor allocation failed");
-        monitor_free(&monitor);
-        ensureSpeakerReady();
-        setRadioPhase(RadioPhase::Error);
+    if (!ensureRxMonitorBuffers()) {
         return false;
     }
 
-    Serial.printf("RX monitor ready: block=%d, bins=%d, heap=%u\n",
-        monitor.block_size, monitor.wf.num_bins,
+    int bufferIndex = acquireRxCaptureBuffer();
+    if (bufferIndex < 0) {
+        Serial.println("RX all monitor buffers busy; skipping this slot");
+        setRadioPhase(RadioPhase::WaitRxSlot);
+        if (!waitForFt8Slot(true)) {
+            setRadioPhase(timeIsSynced() ? RadioPhase::WaitTxSlot : RadioPhase::WaitSync);
+        }
+        return false;
+    }
+    monitor_t& monitor = rxMonitorBuffers[bufferIndex].monitor;
+    Serial.printf("RX capture buffer=%d block=%d bins=%d heap=%u\n",
+        bufferIndex,
+        monitor.block_size,
+        monitor.wf.num_bins,
         heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 
     setRadioPhase(RadioPhase::WaitRxSlot);
@@ -1824,26 +1988,21 @@ static bool receiveOnce(bool allowCurrentSlot = false)
     ensureMicReady();
     if (!M5.Mic.isEnabled()) {
         Serial.println("Mic begin failed");
-        monitor_free(&monitor);
-        stopMicAndRestoreSpeaker();
+        releaseRxCaptureBuffer(bufferIndex);
         setRadioPhase(RadioPhase::Error);
         return false;
     }
 
-    const bool useCurrentSlot = allowCurrentSlot && currentSlotElapsedSeconds() <= kTxStartGraceSeconds;
-    if (useCurrentSlot) {
-        logUtcEvent("RX capture current slot");
-    } else {
-        if (!waitForFt8Slot(true)) {
-            stopMicAndRestoreSpeaker();
-            monitor_free(&monitor);
-            setRadioPhase(timeIsSynced() ? RadioPhase::WaitTxSlot : RadioPhase::WaitSync);
-            return false;
-        }
+    (void)allowCurrentSlot;
+    uint32_t captureSlotStartUtc = 0;
+    if (!waitForFt8Slot(true, &captureSlotStartUtc)) {
+        releaseRxCaptureBuffer(bufferIndex);
+        setRadioPhase(timeIsSynced() ? RadioPhase::WaitTxSlot : RadioPhase::WaitSync);
+        return false;
     }
     setRadioPhase(RadioPhase::RxCapture);
-    bool captureSlotOdd = currentSlotIsOdd();
-    uint32_t captureSlotEndUtc = static_cast<uint32_t>(((time(nullptr) / 15) + 1) * 15);
+    bool captureSlotOdd = slotStartIsOdd(captureSlotStartUtc);
+    uint32_t captureSlotEndUtc = captureSlotStartUtc + static_cast<uint32_t>(protocolSlotTime() + 0.5f);
 
     logUtcEvent("RX capture start");
     rxPeak = 0;
@@ -1871,9 +2030,6 @@ static bool receiveOnce(bool allowCurrentSlot = false)
         if ((monitor.wf.num_blocks % 10) == 0) {
             Serial.print(".");
         }
-        if (useCurrentSlot && time(nullptr) >= static_cast<time_t>(captureSlotEndUtc)) {
-            break;
-        }
     }
     Serial.println();
     logUtcEvent("RX capture done");
@@ -1881,12 +2037,7 @@ static bool receiveOnce(bool allowCurrentSlot = false)
         static_cast<long>(rxPeak),
         static_cast<unsigned long>(rxSampleTotal ? rxAbsSum / rxSampleTotal : 0),
         static_cast<unsigned long>(rxSampleTotal));
-    stopMicAndRestoreSpeaker();
-    setRadioPhase(RadioPhase::RxDecode);
-    logUtcEvent("RX decode start");
-    runDecodeWaterfall(monitor, captureSlotOdd, captureSlotEndUtc);
-    logUtcEvent("RX decode done");
-    monitor_free(&monitor);
+    queueRxDecodeBuffer(bufferIndex, captureSlotOdd, captureSlotEndUtc);
 
     setRadioPhase(RadioPhase::WaitRxSlot);
     logUtcEvent("RX wait next slot");
@@ -1990,36 +2141,6 @@ static bool writeSilenceSamples(int sampleCount, bool abortOnTxCancel = false)
     return true;
 }
 
-static void playTestTone(float frequencyHz, int durationMs)
-{
-    Serial.printf("Playing test tone %.1f Hz for %d ms\n", frequencyHz, durationMs);
-    int totalFrames = static_cast<int>((durationMs / 1000.0f) * kAudioSampleRate);
-    int16_t chunk[kSpeakerChunkSamples];
-    float phase = 0.0f;
-    float dphi = 2.0f * static_cast<float>(M_PI) * frequencyHz / kAudioSampleRate;
-
-    M5.Speaker.stop();
-    int frameIndex = 0;
-    bool firstChunk = true;
-    while (frameIndex < totalFrames) {
-        int count = min(kSpeakerChunkSamples, totalFrames - frameIndex);
-        for (int i = 0; i < count; ++i) {
-            int16_t sample = static_cast<int16_t>(sinf(phase) * 18000.0f);
-            phase = fmodf(phase + dphi, 2.0f * static_cast<float>(M_PI));
-            chunk[i] = sample;
-        }
-        speakerPlayChunk(chunk, count, firstChunk);
-        firstChunk = false;
-        frameIndex += count;
-    }
-    writeSilenceSamples(kAudioSampleRate / 10);
-    while (M5.Speaker.isPlaying(kSpeakerChannel)) {
-        delay(1);
-    }
-    M5.Speaker.end();
-    Serial.println("Test tone done");
-}
-
 static bool transmitFt8(const char* text, float baseToneHz, bool waitForSlot, bool configuredSlotOnly = false)
 {
     ftx_message_t message;
@@ -2042,6 +2163,21 @@ static bool transmitFt8(const char* text, float baseToneHz, bool waitForSlot, bo
     int waveSamples = numSymbols * samplesPerSymbol;
     int slotSamples = static_cast<int>(protocolSlotTime() * kAudioSampleRate);
     int silenceSamples = max(0, (slotSamples - waveSamples) / 2);
+    int16_t* txWave = static_cast<int16_t*>(heap_caps_malloc(
+        static_cast<size_t>(waveSamples) * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (txWave == nullptr) {
+        txWave = static_cast<int16_t*>(appFastMalloc(static_cast<size_t>(waveSamples) * sizeof(int16_t)));
+    }
+    if (txWave == nullptr) {
+        Serial.println("TX wave allocation failed");
+        renderStatus(true);
+        return false;
+    }
+
+    float phase = 0.0f;
+    for (int i = 0; i < waveSamples; ++i) {
+        txWave[i] = synthSample(tones, i, baseToneHz, phase);
+    }
 
     Serial.printf("Encoding %s: %s\n", protocolText(), text);
     Serial.print("Tones: ");
@@ -2057,7 +2193,10 @@ static bool transmitFt8(const char* text, float baseToneHz, bool waitForSlot, bo
         logUtcEvent("TX wait slot");
     }
 
-    if (waitForSlot && !(configuredSlotOnly ? waitForConfiguredTxSlot() : waitForFt8Slot())) {
+    uint32_t txSlotStartUtc = currentSlotStartUtc();
+    if (waitForSlot && !(configuredSlotOnly ?
+            waitForConfiguredTxSlot(false, &txSlotStartUtc) :
+            waitForFt8Slot(false, &txSlotStartUtc))) {
         if (isTxCancelRequested()) {
             Serial.println("TX cancelled before slot");
             clearTxCancelRequest();
@@ -2066,13 +2205,17 @@ static bool transmitFt8(const char* text, float baseToneHz, bool waitForSlot, bo
             setRadioPhase(RadioPhase::WaitSync);
         }
         setActiveTxMessage(nullptr);
+        free(txWave);
         return false;
     }
 
     setRadioPhase(RadioPhase::TxTransmit);
     logUtcEvent("TX start");
     renderWaterfallTxDivider();
-    addTransmitHistory(text, currentSlotIsOdd(), static_cast<uint32_t>(((time(nullptr) / 15) + 1) * 15));
+    addTransmitHistory(
+        text,
+        slotStartIsOdd(txSlotStartUtc),
+        txSlotStartUtc + static_cast<uint32_t>(protocolSlotTime() + 0.5f));
     Serial.printf("TX audio at %.1f Hz\n", baseToneHz);
     M5.Speaker.stop();
     if (!writeSilenceSamples(silenceSamples, true)) {
@@ -2081,11 +2224,11 @@ static bool transmitFt8(const char* text, float baseToneHz, bool waitForSlot, bo
         clearTxCancelRequest();
         setRadioPhase(RadioPhase::WaitRxSlot);
         setActiveTxMessage(nullptr);
+        free(txWave);
         return false;
     }
 
     int16_t chunk[kSpeakerChunkSamples];
-    float phase = 0.0f;
     int sampleIndex = 0;
     while (sampleIndex < waveSamples) {
         if (isTxCancelRequested()) {
@@ -2094,12 +2237,11 @@ static bool transmitFt8(const char* text, float baseToneHz, bool waitForSlot, bo
             clearTxCancelRequest();
             setRadioPhase(RadioPhase::WaitRxSlot);
             setActiveTxMessage(nullptr);
+            free(txWave);
             return false;
         }
         int count = min(kSpeakerChunkSamples, waveSamples - sampleIndex);
-        for (int i = 0; i < count; ++i) {
-            chunk[i] = synthSample(tones, sampleIndex + i, baseToneHz, phase);
-        }
+        memcpy(chunk, txWave + sampleIndex, count * sizeof(chunk[0]));
 
         speakerPlayChunk(chunk, count);
         sampleIndex += count;
@@ -2111,6 +2253,7 @@ static bool transmitFt8(const char* text, float baseToneHz, bool waitForSlot, bo
         clearTxCancelRequest();
         setRadioPhase(RadioPhase::WaitRxSlot);
         setActiveTxMessage(nullptr);
+        free(txWave);
         return false;
     }
     while (M5.Speaker.isPlaying(kSpeakerChannel)) {
@@ -2120,6 +2263,7 @@ static bool transmitFt8(const char* text, float baseToneHz, bool waitForSlot, bo
             clearTxCancelRequest();
             setRadioPhase(RadioPhase::WaitRxSlot);
             setActiveTxMessage(nullptr);
+            free(txWave);
             return false;
         }
         delay(1);
@@ -2130,32 +2274,8 @@ static bool transmitFt8(const char* text, float baseToneHz, bool waitForSlot, bo
     clearTxCancelRequest();
     setRadioPhase(RadioPhase::WaitRxSlot);
     setActiveTxMessage(nullptr);
+    free(txWave);
     return true;
-}
-
-static void setTxMessage(const String& message)
-{
-    String trimmed = message;
-    trimmed.trim();
-    if (trimmed.length() == 0) {
-        Serial.println("Message unchanged");
-        return;
-    }
-
-    ftx_message_t testMessage;
-    ftx_message_rc_t rc = ftx_message_encode(&testMessage, &hashIf, trimmed.c_str());
-    if (rc != FTX_MESSAGE_RC_OK) {
-        Serial.printf("Message parse failed, rc=%d\n", static_cast<int>(rc));
-        return;
-    }
-
-    char messageCopy[FTX_MAX_MESSAGE_LENGTH];
-    trimmed.toCharArray(messageCopy, sizeof(messageCopy));
-    portENTER_CRITICAL(&appStateMux);
-    strncpy(txMessage, messageCopy, sizeof(txMessage) - 1);
-    txMessage[sizeof(txMessage) - 1] = '\0';
-    portEXIT_CRITICAL(&appStateMux);
-    Serial.printf("Message set: %s\n", messageCopy);
 }
 
 static String readTouchCommand()
@@ -2216,8 +2336,6 @@ static String readTouchCommand()
         }
         if (found) {
             selectedRxToneHz = selected.freqHz;
-            selectedRxSnr = selected.snr;
-            selectedRxUtc = selected.utc;
             strncpy(selectedRxText, selected.text, sizeof(selectedRxText) - 1);
             selectedRxText[sizeof(selectedRxText) - 1] = '\0';
         }
@@ -2229,13 +2347,13 @@ static String readTouchCommand()
     }
 
     if (uiView == UiView::Home && touch.y >= 66 && touch.y < 118) {
+        bool startWorkFreqEdit = false;
         portENTER_CRITICAL(&appStateMux);
         int freqButtonX = screenW - 430;
         int anyButtonX = screenW - 210;
         if (touch.x >= freqButtonX && touch.x < freqButtonX + 196) {
             useSelectedRxTone = true;
-            activeEditField = EditField::WorkFreq;
-            Serial.println("Work Freq: type 200..3000 Hz, then Enter");
+            startWorkFreqEdit = true;
         } else if (touch.x >= anyButtonX && touch.x < anyButtonX + 190 && runtimeAction != RuntimeAction::CQ) {
             useSelectedRxTone = false;
         } else if (touch.x < screenW - 540) {
@@ -2252,46 +2370,38 @@ static String readTouchCommand()
             }
         }
         portEXIT_CRITICAL(&appStateMux);
+        if (startWorkFreqEdit) {
+            beginEditField(EditField::WorkFreq);
+        }
         renderStatus(true);
         return String();
     }
 
     if (uiView == UiView::TxSetting) {
-        if (touch.y < 78 && touch.x >= screenW - 280) {
-            if (touch.x < screenW - 148) {
-                requestManualTxNextSlot();
-            } else {
-                requestTxCancel();
-            }
-            renderStatus(true);
-            return String();
-        }
-
+        bool startWorkFreqEdit = false;
         portENTER_CRITICAL(&appStateMux);
         if (touch.y >= 94 && touch.y < 164 && touch.x < screenW / 2) {
-            activeEditField = EditField::WorkFreq;
-            Serial.println("Work Freq: type 200..3000 Hz or any, then Enter");
+            startWorkFreqEdit = true;
         } else if (touch.y >= 94 && touch.y < 164) {
             txSlotOdd = !txSlotOdd;
-        } else if (touch.y >= 230 && touch.y < 416) {
-            int presetIndex = min(2, max(0, (touch.y - 230) / 62));
-            formatStandardTxMessage(presetIndex, txMessage, sizeof(txMessage));
-            Serial.printf("TX message set from preset %d: %s\n", presetIndex + 1, txMessage);
         }
         portEXIT_CRITICAL(&appStateMux);
+        if (startWorkFreqEdit) {
+            beginEditField(EditField::WorkFreq);
+        }
         renderStatus(true);
         return String();
     }
 
     if (uiView == UiView::Setting) {
         bool volumeChanged = false;
+        EditField editField = EditField::None;
+        bool doSyncTime = false;
         portENTER_CRITICAL(&appStateMux);
         if (touch.y >= 88 && touch.y < 144) {
-            activeEditField = EditField::Callsign;
-            Serial.println("Callsign: type value, then Enter");
+            editField = EditField::Callsign;
         } else if (touch.y >= 154 && touch.y < 210) {
-            activeEditField = EditField::Grid;
-            Serial.println("Grid: type value, then Enter");
+            editField = EditField::Grid;
         } else if (touch.y >= 220 && touch.y < 276) {
             if (touch.x > screenW - 140) {
                 speakerVolumePercent = speakerVolumePercent > 95 ? 100 : speakerVolumePercent + 5;
@@ -2299,12 +2409,27 @@ static String readTouchCommand()
                 speakerVolumePercent = speakerVolumePercent > 5 ? speakerVolumePercent - 5 : 0;
             }
             volumeChanged = true;
-        } else if (touch.y >= 286 && touch.y < 408) {
-            Serial.println("Setting button reserved for future WiFi/NTP UI");
+        } else if (touch.y >= 286 && touch.y < 342 && touch.x >= screenW - 190) {
+            editField = EditField::WifiSsid;
+        } else if (touch.y >= 352 && touch.y < 408 && touch.x >= screenW - 190) {
+            doSyncTime = true;
         }
         portEXIT_CRITICAL(&appStateMux);
+        if (editField != EditField::None) {
+            beginEditField(editField);
+        }
         if (volumeChanged) {
             applySpeakerVolume();
+        }
+        if (doSyncTime) {
+            bool ok = false;
+            if (wifiSsid[0] != '\0' && (WiFi.status() == WL_CONNECTED || connectWifi(wifiSsid, wifiPassword))) {
+                ok = syncTime();
+            }
+            portENTER_CRITICAL(&appStateMux);
+            snprintf(settingNotice, sizeof(settingNotice), "%s", ok ? "Synced, RTC written" : "Sync failed");
+            settingNoticeUntilMs = millis() + 4000;
+            portEXIT_CRITICAL(&appStateMux);
         }
         renderStatus(true);
         return String();
@@ -2314,43 +2439,102 @@ static String readTouchCommand()
 }
 
 #ifdef HAS_TAB5_KEYBOARD
+static String handleKeyboardCharacter(char ch)
+{
+    if (ch == '\r') {
+        return String();
+    }
+    if (ch == 27) {
+        if (activeEditField != EditField::None) {
+            cancelActiveEdit();
+        } else {
+            requestTxCancel();
+        }
+        return String();
+    }
+    if (activeEditField == EditField::None) {
+        return String();
+    }
+    if (ch == '\b' || ch == 0x7f) {
+        if (editInputBuffer.length() > 0) {
+            editInputBuffer.remove(editInputBuffer.length() - 1);
+            renderStatus(true);
+        }
+        return String();
+    }
+    if (ch == '\n') {
+        String out = editInputBuffer;
+        out.trim();
+        return out;
+    }
+    size_t maxLen = 20;
+    if (activeEditField == EditField::WifiSsid) {
+        maxLen = sizeof(wifiSsid) - 1;
+    } else if (activeEditField == EditField::WifiPassword) {
+        maxLen = sizeof(wifiPassword) - 1;
+    }
+    if (ch >= 32 && ch <= 126 && editInputBuffer.length() < maxLen) {
+        editInputBuffer += ch;
+        renderStatus(true);
+    }
+    return String();
+}
+
 static String readTab5KeyboardLine()
 {
-    static String line;
     if (!tab5KeyboardReady) {
         return String();
     }
 
     keyboardUnits.update();
-    auto&& events = tab5Keyboard.event();
-    for (auto&& evt : events) {
-        if (evt.type != m5::unit::tab5keyboard::EventType::CHARACTER) {
+    while (!tab5Keyboard.empty()) {
+        auto evt = tab5Keyboard.oldest();
+        tab5Keyboard.discard();
+        if (evt.type != m5::unit::tab5_keyboard::EventType::Hid) {
             continue;
         }
-        for (size_t i = 0; i < evt.chr.length; ++i) {
-            char ch = evt.chr.chars[i];
-            if (ch == '\r') {
-                continue;
+
+        const uint8_t keycode = evt.hid.keycode;
+        if (keycode == 0) {
+            continue;
+        }
+
+        const uint8_t modifier = evt.modifier;
+        const char c = m5::unit::tab5_keyboard::hidUsageToChar(keycode, modifier);
+        Serial.printf("Tab5 keyboard hid key=0x%02x mod=0x%02x char='%c'\n",
+            keycode,
+            modifier,
+            (c >= 32 && c <= 126) ? c : '.');
+
+        char input = 0;
+        switch (keycode) {
+        case kHidEnter:
+            input = '\n';
+            break;
+        case kHidBackspace:
+        case kHidDelete:
+            input = '\b';
+            break;
+        case kHidEscape:
+            input = 27;
+            break;
+        case kHidTab:
+            input = '\t';
+            break;
+        case kHidSpace:
+            input = ' ';
+            break;
+        default:
+            if (c >= 32 && c <= 126) {
+                input = c;
             }
-            if (ch == 27) {
-                line = "";
-                requestTxCancel();
-                continue;
-            }
-            if (ch == '\b' || ch == 0x7f) {
-                if (line.length() > 0) {
-                    line.remove(line.length() - 1);
-                }
-                continue;
-            }
-            if (ch == '\n') {
-                String out = line;
-                line = "";
-                out.trim();
+            break;
+        }
+
+        if (input != 0) {
+            String out = handleKeyboardCharacter(input);
+            if (out.length() > 0) {
                 return out;
-            }
-            if (ch >= 32 && ch <= 126) {
-                line += ch;
             }
         }
     }
@@ -2363,31 +2547,24 @@ static String readTab5KeyboardLine()
 }
 #endif
 
-static void requestTxNextSlot()
+static bool waitForConfiguredTxSlot(bool abortOnTxRequest, uint32_t* slotStartUtc)
 {
-    if (runtimeAction == RuntimeAction::NoTx) {
-        Serial.println("TX blocked: work logic is NO TX");
-        return;
-    }
-    portENTER_CRITICAL(&appStateMux);
-    txRequested = true;
-    txCancelRequested = false;
-    portEXIT_CRITICAL(&appStateMux);
-    if (radioTaskHandle != nullptr) {
-        xTaskNotifyGive(radioTaskHandle);
-    }
-}
+    while (true) {
+        if (!timeIsSynced()) {
+            Serial.println("Time is not synced");
+            setRadioPhase(RadioPhase::WaitSync);
+            return false;
+        }
 
-static void requestManualTxNextSlot()
-{
-    portENTER_CRITICAL(&appStateMux);
-    txRequested = true;
-    txCancelRequested = false;
-    portEXIT_CRITICAL(&appStateMux);
-    if (radioTaskHandle != nullptr) {
-        xTaskNotifyGive(radioTaskHandle);
+        if (nextSlotIsOdd() == txSlotOdd) {
+            return waitForFt8Slot(abortOnTxRequest, slotStartUtc);
+        }
+
+        Serial.printf("Waiting for %s TX slot\n", txSlotOdd ? "Odd" : "Even");
+        if (!waitForFt8Slot(abortOnTxRequest)) {
+            return false;
+        }
     }
-    Serial.println("Manual TX queued");
 }
 
 static bool submitActiveEdit(const String& input)
@@ -2400,26 +2577,14 @@ static bool submitActiveEdit(const String& input)
 
     String lower = value;
     lower.toLowerCase();
-    if (lower == "esc" || lower == "cancel" || lower == "stop") {
-        activeEditField = EditField::None;
-        Serial.println("Edit cancelled");
-        renderStatus(true);
-        return true;
-    }
-    if (lower.startsWith("set ") || lower == "help" || lower == "?" || lower == "show") {
-        activeEditField = EditField::None;
-        return false;
-    }
 
     if (activeEditField == EditField::Callsign) {
         value.toUpperCase();
         value.toCharArray(stationCallsign, sizeof(stationCallsign));
-        formatStandardTxMessage(0, txMessage, sizeof(txMessage));
         Serial.printf("Callsign set: %s\n", stationCallsign);
     } else if (activeEditField == EditField::Grid) {
         value.toUpperCase();
         value.toCharArray(stationGrid, sizeof(stationGrid));
-        formatStandardTxMessage(0, txMessage, sizeof(txMessage));
         Serial.printf("Grid set: %s\n", stationGrid);
     } else if (activeEditField == EditField::WorkFreq) {
         if (lower == "any" || lower == "*") {
@@ -2438,12 +2603,33 @@ static bool submitActiveEdit(const String& input)
             Serial.println("Work frequency must be 200..3000 Hz, or any");
             return true;
         }
-        txToneHz = freq;
+        workFreqHz = freq;
         useSelectedRxTone = true;
-        Serial.printf("Work frequency=%.1f Hz\n", txToneHz);
+        Serial.printf("Work frequency=%.1f Hz\n", workFreqHz);
+    } else if (activeEditField == EditField::WifiSsid) {
+        value.toCharArray(wifiSsid, sizeof(wifiSsid));
+        Serial.printf("WLAN SSID set: %s\n", wifiSsid);
+        activeEditField = EditField::None;
+        editInputBuffer = "";
+        beginEditField(EditField::WifiPassword);
+        renderStatus(true);
+        return true;
+    } else if (activeEditField == EditField::WifiPassword) {
+        value.toCharArray(wifiPassword, sizeof(wifiPassword));
+        Serial.println("WLAN password set");
+        activeEditField = EditField::None;
+        editInputBuffer = "";
+        bool ok = wifiSsid[0] != '\0' && connectWifi(wifiSsid, wifiPassword);
+        portENTER_CRITICAL(&appStateMux);
+        snprintf(settingNotice, sizeof(settingNotice), "%s", ok ? "WLAN connected" : "WLAN failed");
+        settingNoticeUntilMs = millis() + 4000;
+        portEXIT_CRITICAL(&appStateMux);
+        renderStatus(true);
+        return true;
     }
 
     activeEditField = EditField::None;
+    editInputBuffer = "";
     renderStatus(true);
     return true;
 }
@@ -2451,8 +2637,7 @@ static bool submitActiveEdit(const String& input)
 static void radioTask(void*)
 {
     char txText[FTX_MAX_MESSAGE_LENGTH];
-    float toneHz = kFtxDefaultTxToneHz;
-    bool allowCurrentRxSlot = false;
+    float toneHz = kDefaultWorkFreqHz;
 
     while (true) {
         if (!timeIsSynced()) {
@@ -2472,13 +2657,7 @@ static void radioTask(void*)
         bool nextOdd = nextSlotIsOdd();
         int currentElapsed = currentSlotElapsedSeconds();
         portENTER_CRITICAL(&appStateMux);
-        if (txRequested) {
-            shouldTx = true;
-            txRequested = false;
-            strncpy(txText, txMessage, sizeof(txText) - 1);
-            txText[sizeof(txText) - 1] = '\0';
-            toneHz = txToneHz;
-        } else if (ftxAutoEnabled() && autoTxPending && currentOdd == txSlotOdd &&
+        if (ftxAutoEnabled() && autoTxPending && currentOdd == txSlotOdd &&
             currentElapsed <= kTxStartGraceSeconds) {
             shouldTx = true;
             autoTx = true;
@@ -2486,7 +2665,7 @@ static void radioTask(void*)
             autoTxPending = false;
             strncpy(txText, autoTxMessage, sizeof(txText) - 1);
             txText[sizeof(txText) - 1] = '\0';
-            toneHz = txToneHz;
+            toneHz = workFreqHz;
             autoTxStage = autoQsoStage;
         } else if (ftxAutoEnabled() && autoTxPending && nextOdd == txSlotOdd) {
             shouldTx = true;
@@ -2494,7 +2673,7 @@ static void radioTask(void*)
             autoTxPending = false;
             strncpy(txText, autoTxMessage, sizeof(txText) - 1);
             txText[sizeof(txText) - 1] = '\0';
-            toneHz = txToneHz;
+            toneHz = workFreqHz;
             autoTxStage = autoQsoStage;
         } else if (runtimeAction == RuntimeAction::CQ && autoQsoStage > 0 && !autoTxPending) {
             autoCqRxSlot = true;
@@ -2506,14 +2685,14 @@ static void radioTask(void*)
             autoCqTx = true;
             autoTxStage = 1;
             formatStandardTxMessage(0, txText, sizeof(txText));
-            toneHz = txToneHz;
+            toneHz = workFreqHz;
         } else if (runtimeAction == RuntimeAction::CQ && autoQsoStage == 0) {
             shouldTx = true;
             autoTx = true;
             autoCqTx = true;
             autoTxStage = 1;
             formatStandardTxMessage(0, txText, sizeof(txText));
-            toneHz = txToneHz;
+            toneHz = workFreqHz;
         } else if (ftxAutoEnabled() && autoTxPending) {
             autoTxWaiting = true;
         }
@@ -2533,7 +2712,6 @@ static void radioTask(void*)
                 markAutoCqSent();
             }
             transmitFt8(txText, toneHz, !autoTxNow, autoTx);
-            allowCurrentRxSlot = true;
             if (autoTx && autoTxStage >= 4) {
                 portENTER_CRITICAL(&appStateMux);
                 autoQsoStage = 0;
@@ -2543,9 +2721,7 @@ static void radioTask(void*)
             continue;
         }
 
-        bool useCurrentRxSlot = allowCurrentRxSlot;
-        allowCurrentRxSlot = false;
-        if (receiveOnce(useCurrentRxSlot)) {
+        if (receiveOnce()) {
             finishAutoCqListenSlot();
         }
         delay(1);
@@ -2572,12 +2748,17 @@ bool ft8AppBegin()
     strncpy(stationGrid, kFtxStationGrid, sizeof(stationGrid) - 1);
     stationGrid[sizeof(stationGrid) - 1] = '\0';
     selectedRxText[0] = '\0';
-    formatStandardTxMessage(0, txMessage, sizeof(txMessage));
-    txSlotOdd = configTxSlotIsOdd();
+    txSlotOdd = kDefaultTxSlotOdd;
 
     displayMutex = xSemaphoreCreateMutex();
     if (displayMutex == nullptr) {
         Serial.println("display mutex allocation failed");
+        setRadioPhase(RadioPhase::Error);
+        return false;
+    }
+    decodeQueue = xQueueCreate(kRxMonitorBufferCount, sizeof(int));
+    if (decodeQueue == nullptr) {
+        Serial.println("decode queue allocation failed");
         setRadioPhase(RadioPhase::Error);
         return false;
     }
@@ -2587,17 +2768,40 @@ bool ft8AppBegin()
     renderStatus(true);
 
 #ifdef HAS_TAB5_KEYBOARD
+    Serial.println("Tab5 keyboard support: compiled");
     auto keyboardCfg = tab5Keyboard.config();
-    keyboardCfg.start_periodic = false;
-    keyboardCfg.event_mode = m5::unit::tab5keyboard::EventMode::CHARACTER;
+    keyboardCfg.start_periodic = true;
+    keyboardCfg.mode = m5::unit::tab5_keyboard::Mode::Normal;
+    keyboardCfg.irq_pin = TAB5_KEYBOARD_INT;
     tab5Keyboard.config(keyboardCfg);
-    keyboardUnits.add(tab5Keyboard);
-    tab5KeyboardReady = keyboardUnits.begin();
-    Serial.printf("Tab5 keyboard: %s\n", tab5KeyboardReady ? "ready" : "not found");
+    Wire.end();
+    Wire.begin(TAB5_KEYBOARD_SDA, TAB5_KEYBOARD_SCL, TAB5_KEYBOARD_I2C_CLOCK);
+    tab5KeyboardReady = keyboardUnits.add(tab5Keyboard, Wire) && keyboardUnits.begin();
+    if (tab5KeyboardReady) {
+        tab5KeyboardReady = tab5Keyboard.writeMode(m5::unit::tab5_keyboard::Mode::HID);
+        tab5Keyboard.flush();
+    }
+    Serial.printf("Tab5 keyboard: %s\n", tab5KeyboardReady ? "ready HID" : "not found");
+#else
+    Serial.println("Tab5 keyboard support: not compiled; install M5UnitUnified and M5Unit-KEYBOARD");
 #endif
 
     if (wifiSsid[0] != '\0' && connectWifi(wifiSsid, wifiPassword)) {
         syncTime();
+    }
+
+    BaseType_t decodeCreated = xTaskCreatePinnedToCore(
+        decodeTask,
+        "ft8Decode",
+        kDecodeTaskStackBytes,
+        nullptr,
+        kDecodeTaskPriority,
+        &decodeTaskHandle,
+        1);
+    if (decodeCreated != pdPASS) {
+        Serial.println("decode task allocation failed");
+        setRadioPhase(RadioPhase::Error);
+        return false;
     }
 
     BaseType_t created = xTaskCreatePinnedToCore(
@@ -2605,7 +2809,7 @@ bool ft8AppBegin()
         "ft8Radio",
         kRadioTaskStackBytes,
         nullptr,
-        1,
+        kRadioTaskPriority,
         &radioTaskHandle,
         0);
     if (created != pdPASS) {

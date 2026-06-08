@@ -1,4 +1,6 @@
 #include <M5Unified.h>
+#include <M5UnitUnified.h>
+#include <M5UnitUnifiedKEYBOARD.h>
 #include "src/Ft8ArduinoApp.h"
 
 void setup()
