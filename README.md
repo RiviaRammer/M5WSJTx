@@ -7,12 +7,6 @@ A FT4/FT8 codec on M5Stack hardwares.
 
 - FT8  
 
-## Usage
-
-- **ESC**: Abort the current task  
-- **Fn + M**: Switch modulation/demodulation mode  
-- **/**: Change Home/Message/Waterfall
-
 ## Acknowledgements
 
 The FT8 core functionality of this project is made possible thanks to:  
