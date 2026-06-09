@@ -111,8 +111,8 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg)
     if ((me->last_frame == NULL) || (me->fft_timedata == NULL) || (me->fft_freqdata == NULL))
         return;
 
-    LOG(LOG_INFO, "Block size = %d\n", me->block_size);
-    LOG(LOG_INFO, "Subblock size = %d\n", me->subblock_size);
+    LOG(LOG_DEBUG, "Block size = %d\n", me->block_size);
+    LOG(LOG_DEBUG, "Subblock size = %d\n", me->subblock_size);
 
     size_t fft_work_size = 0;
     kiss_fftr_alloc(me->nfft, 0, 0, &fft_work_size);
@@ -121,7 +121,7 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg)
         return;
     me->fft_cfg = kiss_fftr_alloc(me->nfft, 0, me->fft_work, &fft_work_size);
 
-    LOG(LOG_INFO, "N_FFT = %d\n", me->nfft);
+    LOG(LOG_DEBUG, "N_FFT = %d\n", me->nfft);
     LOG(LOG_DEBUG, "FFT work area = %zu\n", fft_work_size);
 
 #ifdef WATERFALL_USE_PHASE
